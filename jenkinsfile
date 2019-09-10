@@ -1,105 +1,107 @@
-node {
-    withMaven(maven:'M3') {
-        stage('Checkout') {
-            def scmVars = checkout scm
-	        env.IMAGE_TAG = scmVars.GIT_COMMIT[0..6] + '.' + env.BUILD_NUMBER
-        }
+node {  
+   stage('Checkout (Source Code)') {
+       def scmVars = checkout scm
+       env.IMAGE_TAG = scmVars.GIT_COMMIT[0..6] + '.' + env.BUILD_NUMBER
 
-        stage("Build") {
-            withSonarQubeEnv('sonarqube-server') {
-                sh 'mvn -s /var/jenkins_home/settings.xml -U clean org.jacoco:jacoco-maven-plugin:prepare-agent package sonar:sonar'
-            }
-        }
+      env.NEXUS_SERVER = 'IP.ec2.internal'
+      env.API_SERVER = 'IP.ec2.internal'
+      
+      if (env.CLOUD_PROVIDER == 'azure') {
+        env.NEXUS_SERVER = 'SERVERe.com'
+        env.API_SERVER = 'k8s-SERVER.com'
+      }
+
+      if (env.CLOUD_PROVIDER == 'swms') {
+        env.NEXUS_SERVER = 'nexus.local'
+        env.API_SERVER = 'server.local'
+      }
         
-        
-        stage('Fortify') {
-
-                     dir ('/opt/shared/HPE_Security/Fortify_SCA_and_Apps_17.20/bin')
-                     {
-                        withCredentials([string(credentialsId: 'appjenkinsST', variable: 'FORTIFY_TOKEN')])
-                        {
-                          sh './sourceanalyzer -64 -b helloworld -clean'
-                          sh './sourceanalyzer -64 -b helloworld ${WORKSPACE}'
-                          sh './sourceanalyzer -64 -b helloworld -scan -64 -verbose -Xmx6G -format "fpr" -f ${WORKSPACE}/Assessment.fpr'
-                          sh './ReportGenerator -template "DeveloperWorkbook.xml" -format "pdf" -f ${WORKSPACE}/Assessment.pdf -source ${WORKSPACE}/Assessment.fpr'
-                          sh './fortifyclient -url http://xxxxxxx:8080/ssc -authtoken ${FORTIFY_TOKEN} -user appjenkinsST uploadFPR -f ${WORKSPACE}/Assessment.fpr -application "helloworld" -applicationVersion "1.0"'
-                        }
-                     }
-                    archiveArtifacts 'Assessment.pdf'
-        }
-        
-/*        
-        stage("Quality Gate"){
-          timeout(time: 1, unit: 'HOURS') {
-            withSonarQubeEnv('sonarqube-server') {
-                def qg = waitForQualityGate()
-
-                if (qg.status != 'OK') {
-                  error "Pipeline aborted due to quality gate failure: ${qg.status}"
-                }
-            }
-          }
-        }
-*/
-/*
-        stage ('Test Framework') {
-          sh '/var/jenkins_home/test_automation/node/bin/node /var/jenkins_home/test_automation/node_modules/selenium-cucumber-js/index.js -s /var/jenkins_home/test_automation/common/step-definitions -f ./test-framework/features -o /var/jenkins_home/test_automation/common/shared-objects -r ./test-framework/reports -b phantomjs'
-        }
-
-        stage('Test Results') {
-            junit '* * / target/surefire-reports/TEST-*.xml'
-            archive 'target/*.jar'
-        }
-*/
-		
-        stage('Docker Build') {
-            // Run the docker image and push
- 		    sh 'mvn -s /var/jenkins_home/settings.xml -DDOCKER_HOST=doi-jenkins.sail.triad.local -DpushImageTags -DdockerImageTags=latest -DdockerImageTags=${IMAGE_TAG} docker:build'           
-        }
-
-        stage('Twistlock Scan') {
-            twistlockScan ca: '', cert: '', compliancePolicy: 'warn', dockerAddress: 'unix:///var/run/docker.sock', ignoreImageBuildTime: true, image: 'sail-helloworld', key: '', logLevel: 'true', policy: 'warn', requirePackageUpdate: false, timeout: 10
-        }
-
-        stage('Twistlock Publish') {
-            twistlockPublish ca: '', cert: '', dockerAddress: 'unix:///var/run/docker.sock', ignoreImageBuildTime: true, image: 'sail-helloworld', key: '', logLevel: 'true', timeout: 10
-        }
-
-        stage('Docker Push') {
-            // Run the docker image and push
-            sh 'mvn -s /var/jenkins_home/settings.xml -DDOCKER_HOST=doi-jenkins.sail.triad.local -DpushImageTags -DdockerImageTags=latest -DdockerImageTags=${IMAGE_TAG} docker:push'           
-        }
-        
-        /*
-        stage ('Docker Deploy') {
-            docker.withTool('docker') {
-                docker.withServer('tcp://xxxxxxxxxx:2375', '') {
-                    sh "docker stop helloworld || true"
-                    sh "docker rm \$(docker ps -a -f=name=helloworld -q) || true"
-                    sh "docker rmi \$(docker images -a | awk '\$1 ~ /helloworld/ { print \$3}') || true"
-                    sh "docker login -u admin -p admin123 dockerregistry.sail.triad.local"
-
-                    def image = docker.image("nexus/sail-helloworld")
-                    def container = image.run("-d --restart=always --name helloworld -p 80:8080")
-                }
-            }
-        }
-        */
-        
-        stage ('k8s Deploy') {
-		    wrap([$class: 'KubectlBuildWrapper', caCertificate: '', credentialsId: 'mcrew-kubedev', serverUrl: 'https://kubernetes:6443']) {
-		    	sh "sed -i 's/:latest/:${IMAGE_TAG}/g' k8s/deployment.yaml"
-	    	    sh "kubectl apply -f k8s/"
-	
-	    		try {
-			  		timeout(time: 5, unit: 'MINUTES') {
-	    			    sh "kubectl rollout status deployment/helloworld-deployment"
-	    			}
-	    		} catch(err) {
-	    			sh "kubectl rollout undo deployment/helloworld-deployment"
-	    			throw err
-	    		}
-			}
-		}
+       sh "sed -i 's/ip-.ec2.internal/${NEXUS_SERVER}/g' k8s/deployment.yaml"
+       sh "sed -i 's/ip-1.ec2.internal/${API_SERVER}/g' src/environments/environment.ts"
+       sh "sed -i 's/ip-.ec2.internal/${API_SERVER}/g' src/environments/environment.prod.ts"
     }
+    
+    stage ('Quality Gate') {
+        docker.withTool('docker') {
+            docker.withRegistry('https://${NEXUS_SERVER}/', 'nexus-registry') {
+              def image = docker.build("joejoe:${IMAGE_TAG}")
+               image.push()
+            }
+        }
+    }
+
+    stage ('Build and Test') {
+        docker.withTool('docker') {
+            docker.withRegistry('https://${NEXUS_SERVER}/', 'nexus-registry') {
+              def image = docker.build("joejoe:${IMAGE_TAG}")
+               image.push()
+            }
+        }
+    }
+
+    stage ('Deploy - DN') {
+      if (env.CLOUD_PROVIDER == 'azure') {
+			   wrap([$class: 'KubectlBuildWrapper', caCertificate: '', credentialsId: 'kube-cluster-token', serverUrl: 'https://10.0.0.5:6443']) {
+		    	  sh "sed -i 's/:latest/:${IMAGE_TAG}/g' k8s/deployment.yaml"
+		    	  sh "kubectl apply -f k8s/"
+
+		    	  try {
+				      timeout(time: 180, unit: 'SECONDS') {
+		    			   sh "kubectl rollout status deployment/craf-deployment"
+		    			}
+		    		} catch(err) {
+		    			sh "kubectl rollout undo deployment/craf-deployment"
+		    			throw err
+		    		}
+	    	 }
+      } else if (env.CLOUD_PROVIDER == 'dnx') {
+      
+			   wrap([$class: 'KubectlBuildWrapper', caCertificate: '', credentialsId: 'kube-cluster-token', serverUrl: 'https://swms-k8s1.sail.triad.local:6443']) {
+		    	  sh "sed -i 's/:latest/:${IMAGE_TAG}/g' k8s/deployment.yaml"
+		    	  sh "kubectl apply -f k8s/"
+
+		    	  try {
+				      timeout(time: 180, unit: 'SECONDS') {
+		    			   sh "kubectl rollout status deployment/jojo-deployment"
+		    			}
+		    		} catch(err) {
+		    			sh "kubectl rollout undo deployment/jojo-deployment"
+		    			throw err
+		    		}
+	    	 }
+         
+      } else {
+        wrap([$class: 'KubectlBuildWrapper', caCertificate: '', credentialsId: 'kube-cluster-token', serverUrl: 'https://IP:6443']) {
+           sh "sed -i 's/:latest/:${IMAGE_TAG}/g' k8s/deployment.yaml"
+           sh "kubectl apply -f k8s/"
+
+           try {
+                timeout(time: 180, unit: 'SECONDS') {
+                  sh "kubectl rollout status deployment/jojo-deployment"
+               }
+           } catch(err) {
+             sh "kubectl rollout undo deployment/jojo-deployment"
+             throw err
+           }
+        }
+      }
+	}
+
+  stage ('Deploy - DNX') {
+      if (env.CLOUD_PROVIDER == 'dnx') {
+			   wrap([$class: 'KubectlBuildWrapper', caCertificate: '', contextName: 'mycluster', credentialsId: 'kube-cluster-token-icp', serverUrl: 'https://172.16.151.111:8001']) {
+		    	  sh "sed -i 's/:latest/:${IMAGE_TAG}/g' k8s/deployment.yaml"
+		    	  sh "kubectl --kubeconfig /opt/jenkins/config apply -f k8s/"
+
+		    	  try {
+				      timeout(time: 180, unit: 'SECONDS') {
+		    			   sh "kubectl --kubeconfig /opt/jenkins/config rollout status deployment/jojo-deployment"
+		    			}
+		    		} catch(err) {
+		    			sh "kubectl --kubeconfig /opt/jenkins/config rollout undo deployment/jojo-deployment"
+		    			throw err
+		    		}
+	    	 }
+      }
+	}
 }
